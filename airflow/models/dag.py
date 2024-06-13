@@ -4237,3 +4237,78 @@ def _get_or_create_dagrun(
     )
     log.info("created dagrun %s", dr)
     return dr
+
+def _run_inline_trigger(trigger):
+    async def _run_inline_trigger_main():
+        async for event in trigger.run():
+            return event
+
+    return asyncio.run(_run_inline_trigger_main())
+
+
+def _run_task(*, ti: TaskInstance, inline_trigger: bool = False, session: Session):
+    """
+    Run a single task instance, and push result to Xcom for downstream tasks.
+
+    Bypasses a lot of extra steps used in `task.run` to keep our local running as fast as
+    possible.  This function is only meant for the `dag.test` function as a helper function.
+
+    Args:
+        ti: TaskInstance to run
+    """
+    log.info("[DAG TEST] starting task_id=%s map_index=%s", ti.task_id, ti.map_index)
+    while True:
+        try:
+            log.info("[DAG TEST] running task %s", ti)
+            ti._run_raw_task(session=session, raise_on_defer=inline_trigger)
+            break
+        except TaskDeferred as e:
+            log.info("[DAG TEST] running trigger in line")
+            event = _run_inline_trigger(e.trigger)
+            ti.next_method = e.method_name
+            ti.next_kwargs = {"event": event.payload} if event else e.kwargs
+            log.info("[DAG TEST] Trigger completed")
+        session.merge(ti)
+        session.commit()
+    log.info("[DAG TEST] end task task_id=%s map_index=%s", ti.task_id, ti.map_index)
+
+
+def _get_or_create_dagrun(
+    dag: DAG,
+    conf: dict[Any, Any] | None,
+    start_date: datetime,
+    execution_date: datetime,
+    run_id: str,
+    session: Session,
+    data_interval: tuple[datetime, datetime] | None = None,
+) -> DagRun:
+    """Create a DAG run, replacing an existing instance if needed to prevent collisions.
+
+    This function is only meant to be used by :meth:`DAG.test` as a helper function.
+
+    :param dag: DAG to be used to find run.
+    :param conf: Configuration to pass to newly created run.
+    :param start_date: Start date of new run.
+    :param execution_date: Logical date for finding an existing run.
+    :param run_id: Run ID for the new DAG run.
+
+    :return: The newly created DAG run.
+    """
+    log.info("dagrun id: %s", dag.dag_id)
+    dr: DagRun = session.scalar(
+        select(DagRun).where(DagRun.dag_id == dag.dag_id, DagRun.execution_date == execution_date)
+    )
+    if dr:
+        session.delete(dr)
+        session.commit()
+    dr = dag.create_dagrun(
+        state=DagRunState.RUNNING,
+        execution_date=execution_date,
+        run_id=run_id,
+        start_date=start_date or execution_date,
+        session=session,
+        conf=conf,
+        data_interval=data_interval,
+    )
+    log.info("created dagrun %s", dr)
+    return dr
